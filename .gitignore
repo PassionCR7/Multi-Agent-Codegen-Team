@@ -1,0 +1,40 @@
+# === Python ===
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# === 虚拟环境 ===
+.venv/
+venv/
+env/
+ENV/
+
+# === 环境变量（含密钥，切勿提交）===
+.env
+.env.local
+.env.*.local
+
+# === 运行时产物 ===
+_agent_workspace/
+*.log
+
+# === 测试与覆盖率 ===
+.pytest_cache/
+.coverage
+htmlcov/
+
+# === 编辑器 ===
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# === 本地工具工作目录（含本机路径等私有信息，切勿提交）===
+.workbuddy/

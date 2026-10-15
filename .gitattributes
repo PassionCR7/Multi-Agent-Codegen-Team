@@ -1,0 +1,26 @@
+# 统一换行符：仓库内一律存 LF，避免不同系统下出现"整个文件都改了"的假 diff
+* text=auto eol=lf
+
+# 明确指定为文本、强制 LF
+*.py    text eol=lf
+*.md    text eol=lf
+*.txt   text eol=lf
+*.json  text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+*.html  text eol=lf
+*.css   text eol=lf
+*.js    text eol=lf
+
+# Windows 批处理需要 CRLF 才能正常执行
+*.bat   text eol=crlf
+*.cmd   text eol=crlf
+
+# 二进制文件不做换行符转换
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.ico   binary
+*.pdf   binary
+*.zip   binary
