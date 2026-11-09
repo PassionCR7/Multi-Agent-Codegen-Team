@@ -6,17 +6,25 @@
 
 拆成两段是刻意的：计划确认需要人的介入（等待时间不可控），而执行阶段是纯自动的。
 分开后，执行阶段可以随时从已批准的 Plan 续跑，也便于在 CI 里跳过人工环节。
+
+P0/P1 新增：
+    * 执行前校验 Mandate（计划授权指纹），计划被改动即中止；
+    * 每个节点后写 status.json 的 ticket_stage / report / attention；
+    * 失败或中止时生成一个“待你决定”的 attention，而不是只返回一段日志。
 """
 
 from __future__ import annotations
 
-import json
+import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
 from .config import SETTINGS
 from .graph import build_graph
-from .plan import is_approved, render_plan
+from .lifecycle import derive_stage, make_attention, make_report
+from .mandate import MandateError, build_mandate, verify_mandate
+from .plan import is_approved
 from .scanner import ProjectScanner
 from .state import new_state, summarize_state
 from .workspace import new_workspace
@@ -33,6 +41,35 @@ NODE_LABELS = {
 }
 
 
+def _now() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _publish_lifecycle(ws, state: dict[str, Any]) -> None:
+    """把阶段/报告/待办写进 status.json，供 Web 轮询。"""
+    state["ticket_stage"] = derive_stage(state)
+    ws.update_status(
+        schema_version=2,
+        ticket_id=state.get("ticket_id") or ws.task_name,
+        ticket_stage=state["ticket_stage"],
+        report=state.get("report") or {},
+        attention=state.get("attention") or {},
+        mandate=state.get("mandate") or {},
+        assignments=state.get("assignments") or [],
+    )
+
+
+def _end_assignment(state: dict[str, Any], reason: str) -> None:
+    assignments = list(state.get("assignments") or [])
+    if not assignments:
+        return
+    last = dict(assignments[-1])
+    if last.get("state") == "running":
+        last.update({"state": "ended", "ended_at": _now(), "ended_reason": reason})
+        assignments[-1] = last
+    state["assignments"] = assignments
+
+
 def run_team(
     requirement: str,
     project_root: str | Path,
@@ -40,6 +77,7 @@ def run_team(
     workspace_root: str | Path | None = None,
     task_name: str | None = None,
     plan: dict[str, Any] | None = None,
+    mandate: dict[str, Any] | None = None,
     workspace_dir: str | Path | None = None,
     on_event: Callable[[dict[str, Any]], None] | None = None,
     checkpointer=None,
@@ -52,12 +90,13 @@ def run_team(
         workspace_root:工作区上级目录，默认 project_root/_agent_workspace。
         task_name:     任务名，默认按时间戳生成。
         plan:          已批准的行动计划。传入后直接进入执行阶段（强约束生效）。
+        mandate:       与 plan 对应的不可变授权；未传时自动从已批准 plan 生成。
         workspace_dir: 复用已存在的工作区目录（通常是 Phase 0 建好的那个）。
         on_event:      事件回调，用于实时展示（CLI / Web / 日志）。
         checkpointer:  LangGraph 持久化后端（可选）。
 
     Returns:
-        最终状态字典（含工作区路径与摘要）。
+        最终状态字典（含工作区路径、生命周期字段与摘要）。
     """
     project_root = Path(project_root).resolve()
     workspace_root = Path(workspace_root).resolve() if workspace_root else project_root / SETTINGS.workspace_dirname
@@ -81,9 +120,19 @@ def run_team(
         if on_event:
             on_event({"type": "workspace", "path": str(ws.dir), "snapshot": snapshot.get("totals", {})})
 
-    # 2) 计划：必须有已批准的计划，否则交给 supervisor 先规划（安全网）
+    # 2) 计划与授权
     if not is_approved(plan):
         ws.post_message("system", "警告：未提供已批准的计划，将先由 PLANNER 规划。", kind="warning")
+    elif mandate is None:
+        mandate = build_mandate(plan, approved_by="auto").to_dict()
+
+    if is_approved(plan):
+        try:
+            verify_mandate(plan, mandate)
+        except MandateError as exc:
+            # 不在这里直接退出：让 supervisor 走统一的 abort 路径，
+            # 这样 report / attention / 状态牌都会一致落盘。
+            ws.post_message("system", f"计划授权校验失败：{exc}", kind="warning")
 
     # 3) 构造初始状态
     state = new_state(
@@ -92,7 +141,18 @@ def run_team(
         workspace_root=str(workspace_root),
         workspace_dir=str(ws.dir),
         plan=plan,
+        mandate=mandate,
+        ticket_id=ws.task_name,
     )
+    assignment_id = f"assign-{int(time.time() * 1000)}"
+    state["assignments"] = [{
+        "id": assignment_id,
+        "state": "running",
+        "attempt": 1,
+        "started_at": _now(),
+    }]
+    state["report"] = make_report(state, "progress", "开始执行")
+    _publish_lifecycle(ws, state)
 
     # 4) 执行图，流式推送每个节点的更新
     #
@@ -108,33 +168,97 @@ def run_team(
     final_state: dict[str, Any] = dict(state)
     pending_nodes: list[tuple[str, dict]] = []
 
-    for mode, chunk in app.stream(state, config={"recursion_limit": 100},
-                                  stream_mode=["updates", "values"]):
-        if mode == "updates":
-            # 先记录本步是哪些节点、各自返回了什么增量
-            pending_nodes = [(n, u or {}) for n, u in chunk.items()]
-        else:  # values —— reducer 合并后的权威状态
-            final_state = dict(chunk)
-            # 此刻再派发事件，state 才是准确的（含已合并的产物/反馈）
-            if on_event:
-                summary = summarize_state(final_state)
-                for node_name, update in pending_nodes:
-                    on_event({
-                        "type": "node",
-                        "node": node_name,
-                        "label": NODE_LABELS.get(node_name, node_name),
-                        "state": summary,
-                        "update": update,
-                    })
-            pending_nodes = []
+    try:
+        for mode, chunk in app.stream(state, config={"recursion_limit": 100},
+                                      stream_mode=["updates", "values"]):
+            if mode == "updates":
+                # 先记录本步是哪些节点、各自返回了什么增量
+                pending_nodes = [(n, u or {}) for n, u in chunk.items()]
+            else:  # values —— reducer 合并后的权威状态
+                final_state = dict(chunk)
+                # 兜底：LangGraph 不应丢字段，但显式保留可避免旧检查点缺字段
+                final_state.setdefault("ticket_id", state["ticket_id"])
+                final_state.setdefault("mandate", state["mandate"])
+                final_state.setdefault("assignments", state["assignments"])
+                if not final_state.get("report"):
+                    final_state["report"] = state["report"]
+                _publish_lifecycle(ws, final_state)
+                # 此刻再派发事件，state 才是准确的（含已合并的产物/反馈）
+                if on_event:
+                    summary = summarize_state(final_state)
+                    for node_name, update in pending_nodes:
+                        on_event({
+                            "type": "node",
+                            "node": node_name,
+                            "label": NODE_LABELS.get(node_name, node_name),
+                            "state": summary,
+                            "update": update,
+                        })
+                pending_nodes = []
+    except Exception as exc:  # noqa: BLE001
+        final_state = dict(final_state)
+        final_state["phase"] = "aborted"
+        final_state["success"] = False
+        final_state["abort_reason"] = f"{type(exc).__name__}: {exc}"
+        final_state["report"] = make_report(
+            final_state, "failed", f"执行异常：{type(exc).__name__}: {exc}"
+        )
+        final_state["attention"] = make_attention(
+            f"执行过程中发生异常：{type(exc).__name__}: {exc}。是否重试或终止？",
+            options=[{"id": "retry", "label": "重试"}, {"id": "abort", "label": "终止任务"}],
+            source="runner",
+            detail={"error": str(exc)},
+        )
+        _end_assignment(final_state, "error")
+        _publish_lifecycle(ws, final_state)
+        summary = _build_summary(final_state, False, ws)
+        ws.write_report("final_state", {
+            "success": False,
+            "summary": summary,
+            "error": str(exc),
+            "ticket_stage": final_state.get("ticket_stage"),
+            "report": final_state.get("report"),
+            "attention": final_state.get("attention"),
+            "mandate": final_state.get("mandate"),
+        })
+        ws.finalize(False, summary)
+        result = dict(final_state)
+        result.update({"workspace_dir": str(ws.dir), "success": False, "final_summary": summary})
+        if on_event:
+            on_event({"type": "finish", "success": False, "summary": summary, "workspace": str(ws.dir)})
+        return result
 
     # 5) 收尾：判定成功与否并写总结
     success = _judge_success(final_state)
     summary = _build_summary(final_state, success, ws)
+    final_state["success"] = success
+
+    if success:
+        final_state["report"] = make_report(final_state, "ready", summary)
+    else:
+        if not final_state.get("report") or final_state["report"].get("state") not in ("blocked", "failed"):
+            final_state["report"] = make_report(final_state, "failed", summary)
+        if not final_state.get("attention"):
+            final_state["attention"] = make_attention(
+                "任务未完全达成，是否重试或终止？",
+                options=[{"id": "retry", "label": "重试"}, {"id": "abort", "label": "终止任务"}],
+                source="runner",
+                detail={"abort_reason": final_state.get("abort_reason", "")},
+            )
+    _end_assignment(final_state, "completed" if success else "aborted")
+    _publish_lifecycle(ws, final_state)
+    if success:
+        final_state["ticket_stage"] = "awaiting_review"
+
     ws.write_report("final_state", {
         "success": success,
         "summary": summary,
         "plan": final_state.get("plan", {}),
+        "mandate": final_state.get("mandate", {}),
+        "ticket_stage": final_state.get("ticket_stage"),
+        "report": final_state.get("report"),
+        "attention": final_state.get("attention"),
+        "assignments": final_state.get("assignments"),
         "iteration": final_state.get("iteration"),
         "bugfix_rounds": final_state.get("bugfix_rounds"),
         "route_history": final_state.get("route_history", []),
@@ -152,6 +276,13 @@ def run_team(
         "security": final_state.get("security", {}),
         "bugfix": final_state.get("bugfix", {}),
     })
+    ws.update_status(
+        ticket_stage=final_state.get("ticket_stage"),
+        report=final_state.get("report") or {},
+        attention=final_state.get("attention") or {},
+        mandate=final_state.get("mandate") or {},
+        assignments=final_state.get("assignments") or [],
+    )
     ws.finalize(success, summary)
 
     result = dict(final_state)

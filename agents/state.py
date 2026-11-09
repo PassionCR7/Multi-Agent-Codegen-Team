@@ -13,6 +13,7 @@ LangGraph 会自动追加，天然支持多轮迭代时累积产物与历史。
 from __future__ import annotations
 
 import operator
+from pathlib import Path
 from typing import Annotated, Any, Literal, TypedDict
 
 Phase = Literal[
@@ -47,6 +48,7 @@ class AgentState(TypedDict, total=False):
 
     # --- 各 agent 的最新结论（覆盖式）---
     plan: dict                            # 已批准的行动计划（强约束依据）
+    mandate: dict                         # 计划授权指纹（不可变，执行前校验）
     alignment: dict                       # 需求对齐报告
     security: dict                        # 安全审计报告
     bugfix: dict                          # bug 修复报告
@@ -54,6 +56,13 @@ class AgentState(TypedDict, total=False):
     pending_scope_violations: list[str]   # 最近一轮产物越出计划范围的文件（程序化检测）
     read_audit: list[dict]                # coder 按需读取真实项目文件的审计日志
     reconcile: dict                       # 跨模块对账报告（机器信号 + LLM 裁决）
+
+    # --- Ticket 生命周期（P1）---
+    ticket_id: str                        # 本任务 ID（默认取工作区目录名）
+    ticket_stage: str                     # 面向人的阶段：plan_review / working / awaiting_answer ...
+    attention: dict                       # 当前待人工决定的一个具体问题
+    report: dict                          # 结构化报告：progress / waiting / ready / blocked / failed
+    assignments: Annotated[list[dict], operator.add]  # 执行尝试记录
 
     # --- 输出 ---
     final_summary: str
@@ -68,13 +77,24 @@ def new_state(
     workspace_dir: str,
     *,
     plan: dict | None = None,
+    mandate: dict | None = None,
+    ticket_id: str = "",
 ) -> AgentState:
     """构造初始状态。
 
     Args:
         plan: 若用户在进入执行阶段前已批准行动计划，从这里注入；
               不传则为 None，由 supervisor 先路由到 planner。
+        mandate: 与 plan 对应的不可变授权。未传时，如果 plan 已批准，
+                 会自动生成一份 ``approved_by=auto`` 的授权（兼容旧工作区）。
+        ticket_id: 任务 ID，默认取工作区目录名。
     """
+    from .mandate import build_mandate
+    from .plan import is_approved
+
+    if mandate is None and plan and is_approved(plan):
+        mandate = build_mandate(plan, approved_by="auto").to_dict()
+
     return AgentState(
         requirement=requirement,
         acceptance=[
@@ -94,6 +114,7 @@ def new_state(
         phase="start",
         next_agent="planner" if plan is None else "coder",
         plan=plan or {},
+        mandate=mandate or {},
         artifacts=[],
         route_history=[],
         feedback=[],
@@ -103,6 +124,11 @@ def new_state(
         bugfix={},
         reconcile={},
         coder_notes="",
+        ticket_id=ticket_id or Path(str(workspace_dir)).name,
+        ticket_stage="queued" if (plan and is_approved(plan)) else "plan_review",
+        attention={},
+        report={},
+        assignments=[],
         final_summary="",
         success=False,
         abort_reason="",
@@ -145,4 +171,9 @@ def summarize_state(state: AgentState) -> dict[str, Any]:
         "safe": state.get("security", {}).get("safe"),
         "bugs": len(state.get("bugfix", {}).get("bugs", [])),
         "success": state.get("success", False),
+        "ticket_id": state.get("ticket_id", ""),
+        "ticket_stage": state.get("ticket_stage", ""),
+        "report": state.get("report") or {},
+        "attention": state.get("attention") or {},
+        "mandate_id": (state.get("mandate") or {}).get("id", ""),
     }

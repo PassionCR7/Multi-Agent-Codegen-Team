@@ -89,6 +89,7 @@ def main() -> int:
     # [5] 等待计划生成
     st = wait_status(base, tid, {"awaiting_review"})
     check(st.get("status") == "awaiting_review", "任务进入 awaiting_review（规划线程已挂起等待）")
+    check(st.get("ticket_stage") == "plan_review", f"阶段牌为 plan_review（实际 {st.get('ticket_stage')}）")
     plan = st.get("plan") or {}
     check(bool(plan.get("steps")), f"计划含步骤（{len(plan.get('steps', []))} 步）")
     check(bool(plan.get("scope", {}).get("files")), f"计划含范围白名单 {plan.get('scope', {}).get('files')}")
@@ -128,6 +129,9 @@ def main() -> int:
     check(code == 200, "提交批准成功")
     st = wait_status(base, tid, {"done", "aborted", "error"}, timeout=90)
     check(st.get("status") in {"done", "aborted"}, f"任务进入终态（{st.get('status')}）")
+    check(st.get("ticket_stage") in {"awaiting_review", "awaiting_answer", "failed", "blocked"},
+          f"终态带生命周期阶段（实际 {st.get('ticket_stage')}）")
+    check(bool(st.get("report")), "终态带结构化报告")
     check(bool(st.get("timeline")), f"产生执行时间线（{len(st.get('timeline', []))} 条）")
 
     arts = [a["path"] for a in st.get("artifacts", [])]
@@ -137,6 +141,16 @@ def main() -> int:
     # [11] 终态后不可再审
     code, _ = _req(base, "POST", f"/api/tasks/{tid}/review", {"action": "approve"})
     check(code == 409, "终态后拒绝再审（409）")
+
+    # [11b] 没有待办时，attention 接口返回 409
+    code, _ = _req(base, "POST", f"/api/tasks/{tid}/attention", {"option": "retry"})
+    check(code == 409, "无待办时 attention 返回 409")
+
+    # [11c] 任务列表带阶段牌与待办标记
+    code, listing = _req(base, "GET", "/api/tasks")
+    items = listing.get("tasks", [])
+    check(code == 200 and any(t.get("stage") for t in items), "任务列表带 stage 字段")
+    check(any("needs_attention" in t for t in items), "任务列表带 needs_attention 字段")
 
     # [12] 黑板消息
     code, msgs = _req(base, "GET", f"/api/tasks/{tid}/messages")
@@ -149,6 +163,42 @@ def main() -> int:
     # [14] 路径穿越防护
     code, _ = _req(base, "GET", "/static/../server.py")
     check(code in (403, 404), f"静态目录阻止路径穿越（{code}）")
+
+    # [15] 越界 → 待办 → 纳入范围 → 重跑成功
+    code, created2 = _req(base, "POST", "/api/tasks", {
+        "requirement": "实现一个加法函数",
+        "project_root": project_root,
+    })
+    tid2 = created2.get("task_id", "")
+    check(code == 201 and bool(tid2), "创建第二个任务用于范围闸门测试")
+    st2 = wait_status(base, tid2, {"awaiting_review"})
+    _req(base, "POST", f"/api/tasks/{tid2}/review", {
+        "action": "user_plan",
+        "user_plan_text": "1. 新建 allowed.py 实现加法",
+        "scope_files": "allowed.py",
+    })
+    st2 = wait_status(base, tid2, {"awaiting_review"})
+    check(st2.get("plan", {}).get("scope", {}).get("files") == ["allowed.py"], "用户计划范围只含 allowed.py")
+
+    _req(base, "POST", f"/api/tasks/{tid2}/review", {"action": "approve"})
+    st2 = wait_status(base, tid2, {"done", "aborted", "error"})
+    att2 = st2.get("attention") or {}
+    check(st2.get("ticket_stage") == "awaiting_answer", "越界后进入 awaiting_answer")
+    check(att2.get("source") == "scope_violation", "待办来源为 scope_violation")
+    opts2 = {o.get("id") for o in (att2.get("options") or [])}
+    check("expand_scope" in opts2, "待办提供 expand_scope 选项")
+
+    code, _ = _req(base, "POST", f"/api/tasks/{tid2}/attention", {
+        "attention_id": att2.get("id"),
+        "option": "expand_scope",
+        "scope_files": "solution.py",
+    })
+    check(code == 200, "提交“纳入范围并继续”成功")
+    st2 = wait_status(base, tid2, {"done", "aborted", "error"}, timeout=90)
+    check(st2.get("status") == "done", f"重跑后成功（{st2.get('status')}）")
+    check(st2.get("ticket_stage") == "awaiting_review", "重跑后进入 awaiting_review")
+    arts2 = [a["path"] for a in st2.get("artifacts", [])]
+    check("solution.py" in arts2, f"重跑产物包含 solution.py（{arts2}）")
 
     passed = sum(1 for ok, _ in _results if ok)
     total = len(_results)

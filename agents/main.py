@@ -187,6 +187,7 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     _print_banner(project_root)
     ws_root = Path(args.workspace_root).resolve() if args.workspace_root else None
+    mandate = None
 
     # ---------------- Phase 0: 规划 + 用户确认 ----------------
     if args.workspace and args.yes:
@@ -219,6 +220,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             reviewer=reviewer,
         )
         ws_dir = ws.dir
+        mandate = (_state or {}).get("mandate") or None
 
         if not plan:
             print("\n计划未获批准（重规划次数已达上限），流程结束。", file=sys.stderr)
@@ -240,6 +242,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         project_root=project_root,
         task_name=args.task_name,
         plan=plan,
+        mandate=mandate,
         workspace_dir=ws_dir,
         on_event=printer,
     )
@@ -251,6 +254,9 @@ def cmd_run(args: argparse.Namespace) -> int:
             "plan_status": (result.get("plan") or {}).get("status"),
             "iteration": result.get("iteration"),
             "bugfix_rounds": result.get("bugfix_rounds"),
+            "ticket_stage": result.get("ticket_stage"),
+            "attention": result.get("attention"),
+            "report": result.get("report"),
             "final_summary": result.get("final_summary"),
         }, ensure_ascii=False, indent=2))
 

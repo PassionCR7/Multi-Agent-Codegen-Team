@@ -26,6 +26,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from .mandate import MandateError, ScopeGuard, normalize_rel_path
+
 
 def _now() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -117,10 +119,18 @@ class Workspace:
         return self.dir / "state.md"
 
     def artifact_path(self, rel: str) -> Path:
-        """定位产物文件，并强制其落在 artifacts/ 之内（防路径穿越）。"""
-        rel = (rel or "").replace("\\", "/").lstrip("/")
-        target = (self.artifacts_dir / rel).resolve()
-        if not str(target).startswith(str(self.artifacts_dir)):
+        """定位产物文件，并强制其落在 artifacts/ 之内（防路径穿越）。
+
+        用 ``Path.is_relative_to`` 而不是字符串 ``startswith``：
+        后者会把 ``artifacts_evil/`` 误判为 ``artifacts/`` 的子目录。
+        """
+        rel_norm = normalize_rel_path(rel)
+        target = (self.artifacts_dir / rel_norm).resolve()
+        try:
+            inside = target.is_relative_to(self.artifacts_dir)
+        except AttributeError:  # pragma: no cover - Python < 3.9 兜底
+            inside = self.artifacts_dir in target.parents
+        if target == self.artifacts_dir or not inside:
             raise ValueError(f"非法产物路径（越界）: {rel}")
         return target
 
@@ -245,7 +255,47 @@ class Workspace:
         self._write_json(path, data)
         return path
 
-    def apply_patch(self, rel_path: str, patch: list[dict]) -> tuple[bool, str]:
+    def write_artifact_checked(self, rel_path: str, content: str, mandate: dict[str, Any]) -> Path:
+        """写前范围闸门：不在 Mandate 白名单内的文件直接拒绝写入。"""
+        guard = ScopeGuard(mandate)
+        safe_rel = guard.check(rel_path)
+        return self.write_artifact(safe_rel, content)
+
+    def reject_artifact(
+        self,
+        rel_path: str,
+        content: str,
+        reason: str,
+        mandate: dict[str, Any] | None = None,
+    ) -> Path:
+        """把被范围闸门拒绝的产物留档到 reports/scope_rejected/，不写入 artifacts/。"""
+        rejected_dir = self.reports_dir / "scope_rejected"
+        rejected_dir.mkdir(parents=True, exist_ok=True)
+        safe = _safe_name(str(rel_path).replace("/", "_").replace("\\", "_")) or "artifact"
+        name = f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{safe}.json"
+        path = rejected_dir / name
+        self._write_json(path, {
+            "ts": _now(),
+            "path": rel_path,
+            "reason": reason,
+            "mandate_id": (mandate or {}).get("id") if isinstance(mandate, dict) else None,
+            "content": content,
+        })
+        self.post_message(
+            "coder",
+            f"[范围拦截] `{rel_path}` 未写入 artifacts/：{reason}",
+            kind="scope_rejected",
+            path=rel_path,
+            rejection_file=str(path),
+        )
+        return path
+
+    def apply_patch(
+        self,
+        rel_path: str,
+        patch: list[dict],
+        mandate: dict[str, Any] | None = None,
+    ) -> tuple[bool, str]:
         """对一个已存在的产物文件施加"最小替换"补丁。
 
         为什么需要它？跨模块对账往往只需改一行 import 或一个调用名。
@@ -260,6 +310,12 @@ class Workspace:
             (是否成功, 说明)
         """
         from .reader import SafeReader
+
+        if mandate is not None:
+            try:
+                ScopeGuard(mandate).check(rel_path)
+            except MandateError as exc:
+                return False, str(exc)
 
         path = self.artifact_path(rel_path)
         if not path.exists():
