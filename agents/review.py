@@ -21,11 +21,10 @@ from typing import Any, Callable, Protocol
 
 from .config import SETTINGS
 from .graph import build_graph
+from .mandate import build_mandate
 from .plan import (
     STATUS_APPROVED,
-    STATUS_USER_WRITTEN,
     from_user_text,
-    normalize_plan,
     render_plan,
 )
 from .state import new_state
@@ -140,6 +139,10 @@ def run_planning_phase(
         if decision.action == ReviewDecision.APPROVE:
             plan = dict(plan)
             plan["status"] = STATUS_APPROVED
+            mandate = build_mandate(plan, approved_by="user")
+            state["mandate"] = mandate.to_dict()
+            state["plan"] = plan
+            ws.write_report("mandate_approved", mandate.to_dict())
             ws.write_report(f"plan_v{round_index}_approved", plan)
             ws.write_report("plan_approved", plan)  # 固定文件名，供 --workspace --yes 复用
             (ws.reports_dir / "plan_approved.md").write_text(render_plan(plan), encoding="utf-8")
@@ -172,6 +175,10 @@ def run_planning_phase(
             decision2 = reviewer.review(plan, round_index)
             if decision2.action == ReviewDecision.APPROVE:
                 plan["status"] = STATUS_APPROVED
+                mandate = build_mandate(plan, approved_by="user")
+                state["mandate"] = mandate.to_dict()
+                state["plan"] = plan
+                ws.write_report("mandate_approved", mandate.to_dict())
                 ws.write_report(f"plan_v{round_index}_user_approved", plan)
                 ws.write_report("plan_approved", plan)
                 (ws.reports_dir / "plan_approved.md").write_text(render_plan(plan), encoding="utf-8")
@@ -197,12 +204,27 @@ def run_planning_phase(
                 f"计划重规划已达上限（{SETTINGS.max_plan_rounds} 轮），流程中止。",
                 kind="lifecycle",
             )
-            ws.update_status(phase="aborted", plan_aborted=True)
+            ws.update_status(
+                phase="aborted",
+                plan_aborted=True,
+                ticket_stage="failed",
+                report={"state": "failed", "summary": "计划审核未在限定轮次内达成一致"},
+            )
             return ws, {}, {
                 "abort_reason": "计划审核未在限定轮次内达成一致",
                 "success": False,
             }
         # 继续下一轮：planner 会读到 review_note 并针对性重规划
 
-    ws.update_status(phase="planned", plan_status="approved", plan_revision=plan.get("revision"))
+    state["plan"] = plan
+    state["ticket_stage"] = "queued"
+    mandate = state.get("mandate") or {}
+    ws.update_status(
+        phase="planned",
+        plan_status="approved",
+        plan_revision=plan.get("revision"),
+        ticket_stage="queued",
+        report={"state": "waiting", "summary": "计划已批准，等待执行"},
+        mandate=mandate,
+    )
     return ws, plan, state

@@ -21,6 +21,8 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from .mandate import MandateError, normalize_rel_path, scope_allows
+
 # 状态常量
 STATUS_DRAFT = "draft"
 STATUS_APPROVED = "approved"
@@ -234,29 +236,30 @@ def render_scope_brief(plan: dict[str, Any]) -> str:
 # 强约束：范围校验
 # --------------------------------------------------------------------------- #
 def _norm_path(p: str) -> str:
-    return (p or "").replace("\\", "/").strip().lstrip("./").lower()
+    """兼容旧调用：归一化路径；非法路径原样返回，交给检查函数判为越界。"""
+    try:
+        return normalize_rel_path(p)
+    except MandateError:
+        return str(p or "").replace("\\", "/")
 
 
 def check_scope(plan: dict[str, Any], produced_files: list[str]) -> tuple[bool, list[str]]:
     """校验产物是否越出 Plan 范围（强约束的执法点）。
 
+    语义：
+        * ``src/app.py`` 只允许该文件；
+        * ``src/`` 允许目录下所有文件；
+        * 绝对路径、``..``、空路径一律视为越界；
+        * 空 scope 不做限制（兼容旧计划）。
+
     Returns:
         (是否全部在范围内, 越界文件列表)
     """
-    scope = {_norm_path(f) for f in ((plan.get("scope") or {}).get("files") or [])}
+    scope = ((plan.get("scope") or {}).get("files") or [])
     if not scope:
         # 计划未限定范围时不做越界判定，避免误伤
         return True, []
-
-    violations: list[str] = []
-    for f in produced_files:
-        nf = _norm_path(f)
-        if nf in scope:
-            continue
-        # 允许"计划指定目录下的新增文件"（计划写 dir/ 时，dir/xxx 视为在范围内）
-        if any(nf.startswith(s.rstrip("/") + "/") for s in scope if s.endswith("/") or "/" in s):
-            continue
-        violations.append(f)
+    violations = [f for f in produced_files if not scope_allows(scope, f)]
     return (not violations), violations
 
 

@@ -169,6 +169,35 @@
 
 任一路径触顶即路由到 `abort`，把控制权交还给人，而不是无限重试烧 token。
 
+### 3.5 计划授权（Mandate）与写前范围闸门
+
+计划批准不是"记一个 status"，而是生成一份**不可变授权**：
+
+- 批准时计算计划内容指纹，生成 `Mandate`（计划版本、指纹、白名单、批准人、时间）；
+- 执行前 `supervisor` 校验指纹；计划被改动、版本不一致或缺少授权，直接 `abort`；
+- coder / bugfixer / 对账补丁在**写盘前**检查白名单：
+  - `src/app.py` → 只允许这一个文件；
+  - `src/` → 允许目录下所有文件；
+  - 绝对路径、`..`、空路径一律拒绝；
+- 越界文件不会写入 `artifacts/`，而是留档到 `reports/scope_rejected/`，并生成一个"待你决定"事项。
+
+这比"先写出来再检查"更硬：提示词可以请求，代码闸门才负责拒绝。
+
+### 3.6 Ticket 生命周期与"待你决定"
+
+每个任务现在有一块面向人的状态牌：
+
+```
+plan_review → queued → working
+                         ├─ awaiting_answer   （有具体问题等你回答）
+                         ├─ awaiting_review   （产出完成，等你验收）
+                         ├─ blocked / failed
+                         └─ done / aborted
+```
+
+失败、卡住、越界时，系统只问**一个具体问题**，并给 2～3 个按钮（例如"纳入范围并继续 / 终止任务"）。
+Web 页面顶部会优先显示"待你决定"，而不是让你从日志里猜现在该干什么。
+
 ---
 
 ## 四、快速开始
@@ -224,9 +253,45 @@ CODER_MODEL=deepseek-chat
 
 ---
 
-## 五、三种运行方式
+## 五、四种运行方式
 
-### 方式一：Web 界面（推荐先试这个）
+### 方式一：Windows 桌面版（推荐）
+
+独立窗口启动，自带文件夹选择、打开工作区、模型设置和系统通知。
+
+```powershell
+# 开发模式直接启动
+pip install -r requirements-desktop.txt
+python -m desktop.main
+
+# 打开 WebView 调试工具
+python -m desktop.main --debug
+
+# 打包成 exe
+.\packaging\build_windows.ps1
+```
+
+打包输出：
+
+```
+dist\MultiAgentCodegenTeam\MultiAgentCodegenTeam.exe
+```
+
+桌面版默认把配置、日志和任务工作区放在：
+
+```
+%APPDATA%\MultiAgentCodegenTeam\
+├── config.json        # 窗口、最近项目、模型设置
+├── logs\
+│   └── desktop.log    # 桌面端日志
+└── workspaces\        # 任务工作区
+```
+
+关闭窗口时如果还有任务在规划/执行，会先弹确认框。
+
+> API Key 会保存在 `%APPDATA%\MultiAgentCodegenTeam\config.json`，仅限本机使用；如果你更习惯环境变量，也可以继续用 `.env` / 系统环境变量。
+
+### 方式二：Web 界面（浏览器调试）
 
 图形化审核计划，最直观。
 
@@ -243,12 +308,16 @@ python web/server.py --port 9000    # 换端口
 | --- | --- | --- |
 | `POST` | `/api/tasks` | 创建任务（后台开始规划） |
 | `GET` | `/api/tasks/<id>` | 查询任务快照（前端轮询） |
+| `GET` | `/api/health` | 健康检查（桌面启动器就绪探测） |
 | `POST` | `/api/tasks/<id>/review` | 提交审核决策 |
+| `POST` | `/api/tasks/<id>/attention` | 回答"待你决定"的一个具体问题 |
 | `GET` | `/api/tasks/<id>/messages` | 读取黑板消息流 |
+| `GET` | `/api/settings` | 读取模型设置（不返回 API Key 明文） |
+| `POST` | `/api/settings` | 更新 API Key / Base URL / 模型 / Mock |
 
 刷新页面不会丢进度：`http://127.0.0.1:8765/?task=<id>` 可直接打开指定任务。
 
-### 方式二：命令行交互式
+### 方式三：命令行交互式
 
 同样支持计划审核，会在终端问你。
 
@@ -262,7 +331,7 @@ python -m agents.main "你的需求" --project .
 1) 批准    2) 打回重规划    3) 我自己写方案
 ```
 
-### 方式三：全自动（CI / 脚本）
+### 方式四：全自动（CI / 脚本）
 
 ```bash
 # 自动批准首版计划，一条命令跑完
@@ -304,13 +373,15 @@ CODER_MOCK=1 python -m agents.main "实现加法和减法" --project . --auto-pl
 
 ### LLM 相关
 
+> 桌面版可以直接在窗口右上角“设置”里修改 API Key / Base URL / 模型，保存到 AppData；`.env` 主要用于浏览器模式和 CLI。
+
 | 变量 | 说明 | 示例 |
 | --- | --- | --- |
 | `OPENAI_API_KEY` | 你的大模型 API 密钥 | `sk-...` |
 | `OPENAI_BASE_URL` | 服务端点地址 | `https://api.deepseek.com/v1` |
 | `CODER_MODEL` | 模型名 | `deepseek-chat` |
 | `CODER_TEMPERATURE` | 采样温度 | `0.2` |
-| `CODER_TIMEOUT` | 单次请求超时（秒） | `180` |
+| `CODER_TIMEOUT` | 单次请求超时（秒） | `120` |
 | `CODER_MOCK` | 置 `1` 强制离线 Mock 模式 | 空 / `1` |
 
 ### 工作区
@@ -334,12 +405,30 @@ Multi-Agent_for_Planning-Coding-Test-Security/
 ├── DESIGN.md                 内部设计详解（数据层 / 路由决策表 / 已知局限）
 ├── RUNNING.md                运行方式与踩坑排查
 │
+├── desktop/                  Windows 桌面外壳（pywebview）
+│   ├── main.py               单实例 → 后端 → 原生窗口
+│   ├── backend.py            动态端口 / 健康检查 / 优雅关闭
+│   ├── native_api.py         文件夹选择 / 打开目录 / 系统通知
+│   ├── config.py             AppData 配置 / 工作区 / 窗口几何
+│   ├── single_instance.py    单实例锁
+│   └── resources/            应用图标
+│
+├── packaging/                 PyInstaller / Inno Setup 打包
+│   ├── agent-team.spec
+│   ├── build_windows.ps1
+│   └── installer/windows.iss
+│
+├── requirements-desktop.txt  桌面运行依赖
+├── requirements-build.txt    打包依赖
+│
 ├── agents/                   核心实现
 │   ├── main.py               CLI 入口与参数解析（含交互式计划审核）
 │   ├── graph.py              LangGraph 图定义与组装
 │   ├── supervisor.py         调度官：确定性路由规则与计划闸门
 │   ├── nodes.py              各智能体节点实现（planner + 业务 agent + repair）
 │   ├── plan.py               Plan 数据模型与范围校验（强约束的执法点）
+│   ├── mandate.py            计划授权指纹 + 写前范围闸门
+│   ├── lifecycle.py          Ticket 阶段 / 报告 / 待办（Attention）
 │   ├── review.py             计划审核循环（可插拔 reviewer）
 │   ├── prompts.py            各角色提示词（含机器可读角色标记）
 │   ├── scanner.py            真实项目扫描 → project_snapshot.json
@@ -360,7 +449,9 @@ Multi-Agent_for_Planning-Coding-Test-Security/
     ├── selftest.py                 执行阶段自检（58 项：含按需阅读与熔断）
     ├── selftest_plan.py            计划阶段自检（33 项）
     ├── selftest_multimodule.py     模块拆分、对账与共享状态文档自检（52 项）
-    └── test_web_api.py             Web API 端到端测试（24 项，需先启动服务）
+    ├── selftest_mandate.py         Mandate / 写前闸门 / 生命周期自检（41 项）
+    ├── test_desktop_backend.py     桌面后端自检（27 项）
+    └── test_web_api.py             Web API 端到端测试（38 项，需先启动服务）
 ```
 
 ### 任务工作区结构
@@ -387,6 +478,8 @@ reports/
 ├── plan_v2.json / plan_v2.md
 ├── plan_v2_approved.json                 获批的版本
 ├── plan_approved.json / plan_approved.md 固定文件名，供 --workspace --yes 复用
+├── mandate_approved.json                 计划授权指纹（不可变）
+├── scope_rejected/                       被范围闸门拒绝的越界产物留档
 ├── alignment_iter1.json                  需求对齐报告
 ├── security_iter1.json                   安全审计报告
 └── final_state.json                      最终状态汇总
@@ -416,12 +509,14 @@ reports/
 
 ## 九、运行自检
 
-项目自带多组自检脚本（合计 160+ 项断言），改代码后建议全跑一遍：
+项目自带多组自检脚本（合计 249 项断言），改代码后建议全跑一遍：
 
 ```bash
 python -m tests.selftest              # 执行阶段（58 项）
 python -m tests.selftest_plan         # 计划解析与路由约束（33 项）
 python -m tests.selftest_multimodule  # 模块拆分与对账（52 项）
+python -m tests.selftest_mandate      # Mandate / 写前闸门 / 生命周期（41 项）
+python -m tests.test_desktop_backend  # 桌面后端：端口/健康检查/token/设置（27 项）
 
 # Web API 测试需先启动服务
 python web/server.py
@@ -438,6 +533,11 @@ python tests/test_web_api.py --base http://127.0.0.1:8765
 - **大项目扫描有截断**：单文件读取有字节/行数上限，超大文件会被截断，可能影响理解完整性。
 - **Mock 模式仅用于跑通流程**：它产出的是桩代码，不要用于真实业务。
 - **模型质量决定上限**：本框架压制的是"跑偏"，不能弥补模型本身的能力边界。
+- **Mandate 只约束路径，不约束内容正确性**：白名单能阻止写错文件，但不能保证写对内容；内容质量仍由对齐/安全/人工 review 兜底。
+- **Attention 目前是"记录 + 重试/终止"**：更完整的"带答案继续执行"要等断点续跑（P2）落地。
+- **桌面版关闭会中断当前任务**：确认退出后正在规划/执行的任务会停止；工作区文件保留，但 P2 断点续跑尚未实现。
+- **API Key 以明文保存在本机**：桌面版默认写入 `%APPDATA%\MultiAgentCodegenTeam\config.json`，请勿把该文件或 `可使用的API-Key.txt` 提交/分享。
+- **Windows 安装包需另行编译**：`packaging/installer/windows.iss` 已准备好，但需要安装 Inno Setup 才能生成 Setup.exe。
 
 ---
 

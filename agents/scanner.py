@@ -176,9 +176,11 @@ class ProjectScanner:
         def run(*args: str) -> str:
             try:
                 out = subprocess.run(
-                    ["git", *args], cwd=self.root, capture_output=True, text=True, timeout=10
+                    ["git", *args], cwd=self.root, capture_output=True,
+                    text=True, encoding="utf-8", errors="replace", timeout=10,
                 )
-                return out.stdout.strip() if out.returncode == 0 else ""
+                stdout = out.stdout or ""
+                return stdout.strip() if out.returncode == 0 else ""
             except (OSError, subprocess.SubprocessError):
                 return ""
 

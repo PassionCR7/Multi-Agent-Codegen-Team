@@ -15,6 +15,8 @@ from __future__ import annotations
 from typing import Any
 
 from .config import SETTINGS, get_llm
+from .lifecycle import make_attention, make_report
+from .mandate import MandateError
 from .plan import (
     check_scope,
     is_approved,
@@ -124,6 +126,8 @@ def planner_node(state: AgentState) -> dict[str, Any]:
         "plan": plan,
         "plan_rounds": plan_rounds + 1,
         "phase": "planning",
+        "ticket_stage": "plan_review",
+        "report": make_report(state, "waiting", summary),
         "route_history": [{"agent": "planner", "revision": plan["revision"], "steps": len(plan["steps"])}],
     }
 
@@ -199,14 +203,28 @@ def _reads_loop(
     return data, raw, reader_stats
 
 
-def _write_generated(ws: Workspace, files: list[dict], revision: int, errors: list[str]) -> list[dict]:
-    """把模型产出的文件写入工作区，返回用于状态累积的记录。"""
+def _write_generated(
+    ws: Workspace,
+    files: list[dict],
+    revision: int,
+    errors: list[str],
+    mandate: dict[str, Any] | None = None,
+    rejected: list[dict] | None = None,
+) -> list[dict]:
+    """把模型产出的文件写入工作区，返回用于状态累积的记录。
+
+    有 Mandate 时走 ``write_artifact_checked``：越界文件不会被写入，
+    而是留档到 ``reports/scope_rejected/`` 并记录到 ``rejected``。
+    """
     written: list[dict] = []
     for f in files:
         rel = f.get("path") or f.get("filename") or "output.py"
         content = f.get("content", "")
         try:
-            ws.write_artifact(rel, content)
+            if mandate:
+                ws.write_artifact_checked(rel, content, mandate)
+            else:
+                ws.write_artifact(rel, content)
             written.append({
                 "path": rel,
                 "language": f.get("language", "python"),
@@ -214,6 +232,12 @@ def _write_generated(ws: Workspace, files: list[dict], revision: int, errors: li
                 "description": f.get("description", ""),
                 "revision": revision,
             })
+        except MandateError as exc:
+            errors.append(str(exc))
+            if rejected is not None:
+                rejected.append({"path": rel, "reason": str(exc), "content": content})
+            if mandate:
+                ws.reject_artifact(rel, content, str(exc), mandate)
         except ValueError as exc:
             errors.append(str(exc))
     return written
@@ -230,6 +254,8 @@ def _generate_by_module(
     iteration: int,
     trace: list[str],
     errors: list[str],
+    mandate: dict[str, Any] | None = None,
+    rejected: list[dict] | None = None,
 ) -> tuple[list[dict], list[dict]]:
     """按模块分段生成：逐个子任务、顺序生成、接口递增。
 
@@ -314,7 +340,7 @@ def _generate_by_module(
             ws.post_message("coder", f"[子任务 {idx}] 模块 {target} 未产出内容", kind="warning")
             continue
 
-        got = _write_generated(ws, files, iteration + 1, errors)
+        got = _write_generated(ws, files, iteration + 1, errors, mandate=mandate, rejected=rejected)
         written.extend(got)
 
         used = data.get("used_interfaces") or []
@@ -339,6 +365,7 @@ def _reconcile_modules(
     base_user: str,
     revision: int,
     trace: list[str],
+    mandate: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """跨模块对账：机器找信号 → LLM 裁决 → 最小修补。
 
@@ -420,7 +447,7 @@ def _reconcile_modules(
                             f"⚠ 对账项 {f.get('id', '?')} 提供了 patch 但未指定 path，无法自动修补",
                             kind="warning")
             continue
-        ok, msg = ws.apply_patch(path, patch)
+        ok, msg = ws.apply_patch(path, patch, mandate=mandate)
         trace.append(f"[对账-修补] {path}: {msg}")
         if ok:
             patched_total += 1
@@ -484,6 +511,8 @@ def coder_node(state: AgentState) -> dict[str, Any]:
     trace: list[str] = []
     all_written: list[dict] = []
     errors: list[str] = list(state.get("errors", []))
+    rejected: list[dict] = []
+    mandate = state.get("mandate") or None
     requested_total = served_total = 0
 
     # 决定是否按模块分段：修订模式不拆（只改指定问题）；初版且文件数达到阈值才拆
@@ -515,6 +544,7 @@ def coder_node(state: AgentState) -> dict[str, Any]:
             all_written, subtask_context = _generate_by_module(
                 ws=ws, state=state, plan=plan, base_user=base_user, reader=reader,
                 scope_files=scope_files, iteration=iteration, trace=trace, errors=errors,
+                mandate=mandate, rejected=rejected,
             )
             requested_total = sum(c.get("reads", {}).get("requested", 0) for c in subtask_context)
             served_total = sum(c.get("reads", {}).get("served", 0) for c in subtask_context)
@@ -522,7 +552,7 @@ def coder_node(state: AgentState) -> dict[str, Any]:
             # ---- 跨模块对账（机器找信号 → LLM 裁决 → 最小修补）----
             recon_report = _reconcile_modules(
                 ws=ws, state=state, plan=plan, written=all_written, base_user=base_user,
-                revision=iteration + 1, trace=trace,
+                revision=iteration + 1, trace=trace, mandate=mandate,
             )
             if recon_report:
                 # 修补会改动文件内容，需刷新 written 与**共享状态文档**
@@ -542,7 +572,7 @@ def coder_node(state: AgentState) -> dict[str, Any]:
             )
             requested_total += rstats["requested"]
             served_total += rstats["served"]
-            all_written = _write_generated(ws, data.get("files", []) or [], iteration + 1, errors)
+            all_written = _write_generated(ws, data.get("files", []) or [], iteration + 1, errors, mandate=mandate, rejected=rejected)
             recon_report = {}
             _last_notes = data.get("notes", "") or data.get("_raw", "")
             # 为下面的统一处理准备 notes
@@ -552,8 +582,11 @@ def coder_node(state: AgentState) -> dict[str, Any]:
         else:
             notes = f"按模块分段生成 {len(all_written)} 个文件，并完成跨模块对账。"
 
-    # --- 强约束执法：检测产物是否越出计划范围 ---
-    _, violations = check_scope(plan, [w["path"] for w in all_written])
+    # --- 强约束执法：写前已拦截 rejected，这里再对已写入文件做一次兜底检查 ---
+    _, checked_violations = check_scope(plan, [w["path"] for w in all_written])
+    violations = list(dict.fromkeys(
+        [r["path"] for r in rejected] + list(checked_violations)
+    ))
     if violations:
         msg = f"[计划-越界] 以下文件不在已批准计划范围内: {', '.join(violations)}"
         ws.post_message("coder", msg, kind="warning")
@@ -566,7 +599,7 @@ def coder_node(state: AgentState) -> dict[str, Any]:
     else:
         msgs = [f"已生成/修订 {len(all_written)} 个文件: {', '.join(w['path'] for w in all_written)}"]
         if violations:
-            msgs.append(f"⚠ 越界文件 {len(violations)} 个")
+            msgs.append(f"⚠ 越界文件 {len(violations)} 个（已拦截，未写入）")
     if requested_total:
         msgs.append(f"按需阅读: 请求 {requested_total}，成功 {served_total}")
     if use_subtasks:
@@ -596,8 +629,22 @@ def coder_node(state: AgentState) -> dict[str, Any]:
         delta["feedback"] = trace + delta.get("feedback", [])
     if violations:
         delta["feedback"] = delta.get("feedback", []) + [
-            f"[计划-越界] 请移除或回退这些不在计划内的文件: {', '.join(violations)}"
+            f"[计划-越界] 以下文件不在计划内，已被拒绝写入: {', '.join(violations)}"
         ]
+        delta["ticket_stage"] = "awaiting_answer"
+        delta["report"] = make_report(
+            state, "blocked", f"编码阶段有 {len(violations)} 个文件越出计划范围，已暂停等待你决定",
+            evidence={"violations": violations},
+        )
+        delta["attention"] = make_attention(
+            f"以下文件不在已批准计划范围内：{', '.join(violations)}。是否把它们纳入范围后继续？",
+            options=[
+                {"id": "expand_scope", "label": "纳入范围并继续"},
+                {"id": "abort", "label": "终止任务"},
+            ],
+            source="scope_violation",
+            detail={"files": violations},
+        )
     return delta
 
 
@@ -662,12 +709,28 @@ def aligner_node(state: AgentState) -> dict[str, Any]:
         for m in missing
     ]
 
-    return {
+    delta: dict[str, Any] = {
         "alignment": report,
         "feedback": feedback_lines,
         "route_history": [{"agent": "aligner", "aligned": aligned, "iteration": iteration}],
         "phase": "aligning",
+        "report": make_report(
+            state, "blocked" if scope_violations else "progress", summary,
+            evidence={"scope_violations": scope_violations},
+        ),
     }
+    if scope_violations:
+        delta["ticket_stage"] = "awaiting_answer"
+        delta["attention"] = make_attention(
+            f"以下文件不在已批准计划范围内：{', '.join(scope_violations)}。是否把它们纳入范围后继续？",
+            options=[
+                {"id": "expand_scope", "label": "纳入范围并继续"},
+                {"id": "abort", "label": "终止任务"},
+            ],
+            source="scope_violation",
+            detail={"files": scope_violations},
+        )
+    return delta
 
 
 # --------------------------------------------------------------------------- #
@@ -708,6 +771,7 @@ def security_node(state: AgentState) -> dict[str, Any]:
         "feedback": feedback_lines,
         "route_history": [{"agent": "security", "safe": safe, "iteration": iteration}],
         "phase": "security",
+        "report": make_report(state, "progress", summary),
     }
 
 
@@ -737,20 +801,31 @@ def bugfixer_node(state: AgentState) -> dict[str, Any]:
 
     patches = report.get("patches", []) or []
     written = []
+    rejected: list[dict] = []
+    mandate = state.get("mandate") or None
     for p in patches:
         rel = p.get("path", "")
         if not rel:
             continue
+        content = p.get("content", "")
         try:
-            ws.write_artifact(rel, p.get("content", ""))
+            if mandate:
+                ws.write_artifact_checked(rel, content, mandate)
+            else:
+                ws.write_artifact(rel, content)
             written.append({
                 "path": rel,
                 "language": p.get("language", "python"),
-                "content": p.get("content", ""),
+                "content": content,
                 "description": f"修复 {p.get('fixes', '')}: {p.get('explanation', '')}",
                 "revision": iteration + 1,
                 "is_patch": True,
             })
+        except MandateError as exc:
+            state.setdefault("errors", []).append(str(exc))
+            rejected.append({"path": rel, "reason": str(exc), "content": content})
+            if mandate:
+                ws.reject_artifact(rel, content, str(exc), mandate)
         except ValueError as exc:
             state.setdefault("errors", []).append(str(exc))
 
@@ -770,6 +845,23 @@ def bugfixer_node(state: AgentState) -> dict[str, Any]:
     }
     if report.get("notes"):
         delta["feedback"] = [f"[修复说明] {report['notes']}"]
+    if rejected:
+        delta["ticket_stage"] = "awaiting_answer"
+        delta["report"] = make_report(
+            state, "blocked", f"修复阶段有 {len(rejected)} 个补丁越出计划范围，已暂停等待你决定",
+            evidence={"violations": [r["path"] for r in rejected]},
+        )
+        delta["attention"] = make_attention(
+            f"以下修复补丁不在已批准计划范围内：{', '.join(r['path'] for r in rejected)}。是否把它们纳入范围后继续？",
+            options=[
+                {"id": "expand_scope", "label": "纳入范围并继续"},
+                {"id": "abort", "label": "终止任务"},
+            ],
+            source="scope_violation",
+            detail={"files": [r["path"] for r in rejected]},
+        )
+    else:
+        delta["report"] = make_report(state, "progress", summary)
     return delta
 
 
@@ -789,6 +881,7 @@ def repair_node(state: AgentState) -> dict[str, Any]:
         "security": {},
         "bugfix": {},
         "phase": "repairing",
+        "report": make_report(state, "progress", "修复完成，进入复检"),
         "route_history": [{"agent": "system", "action": "recheck", "iteration": iteration}],
     }
 

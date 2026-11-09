@@ -12,6 +12,8 @@ from __future__ import annotations
 from typing import Any, Literal
 
 from .config import SETTINGS
+from .lifecycle import is_attention_open, make_attention, make_report
+from .mandate import MandateError, verify_mandate
 from .plan import is_approved
 from .state import AgentState, latest_artifacts
 from .utils import has_blocking_issues
@@ -25,6 +27,18 @@ def _ws(state: AgentState) -> Workspace:
     return Workspace.from_dir(state["workspace_dir"])
 
 
+def _mandate_error(state: AgentState) -> str:
+    """计划已批准时，校验授权指纹；返回空串表示通过。"""
+    plan = state.get("plan", {}) or {}
+    if not is_approved(plan):
+        return ""
+    try:
+        verify_mandate(plan, state.get("mandate"))
+    except MandateError as exc:
+        return str(exc)
+    return ""
+
+
 def decide(state: AgentState) -> Route:
     """核心路由决策：给定当前状态，返回下一跳。"""
     iteration = state.get("iteration", 0)
@@ -36,7 +50,11 @@ def decide(state: AgentState) -> Route:
     alignment = state.get("alignment", {}) or {}
     security = state.get("security", {}) or {}
 
-    # 0) 达到总循环上限 —— 兜底熔断
+    # 0) 有未回答的待办 —— 必须先等人，不能继续自动跑
+    if is_attention_open(state.get("attention")):
+        return "abort"
+
+    # 0.1) 达到总循环上限 —— 兜底熔断
     if iteration >= SETTINGS.max_iterations:
         return "abort"
 
@@ -52,6 +70,11 @@ def decide(state: AgentState) -> Route:
         if state.get("plan_rounds", 0) >= SETTINGS.max_plan_rounds:
             return "abort"
         return "planner"
+
+    # 0.8) 已批准计划必须带有效的不可变授权（Mandate）
+    #      计划被篡改、版本不一致或缺少授权时，停止执行并交还人类。
+    if _mandate_error(state):
+        return "abort"
 
     # 1) 没有代码 -> 必须先写代码（但有次数上限，防止 coder 一直交白卷导致死循环）
     if not has_code:
@@ -92,6 +115,7 @@ def apply(state: AgentState) -> dict[str, Any]:
     """执行决策并把结果落盘到黑板。"""
     route = decide(state)
     ws = _ws(state)
+    mandate_error = _mandate_error(state)
 
     reason_map = {
         "planner": "尚无已批准的计划，需先规划（等待用户确认）",
@@ -104,6 +128,13 @@ def apply(state: AgentState) -> dict[str, Any]:
         "abort": "达到循环上限，中止并交还人类",
     }
     note = reason_map.get(route, "")
+    if route == "abort":
+        if is_attention_open(state.get("attention")):
+            note = "等待人工决定，暂停自动流程"
+        elif mandate_error:
+            note = "计划授权校验失败，中止"
+        elif state.get("pending_scope_violations") and not latest_artifacts(state):
+            note = "产物越界，等待人工决定"
 
     ws.post_message("supervisor", f"决策: {route} —— {note}", kind="decision", route=route)
     ws.record_turn("supervisor", f"route:{route}", state.get("iteration", 0), note)
@@ -114,8 +145,26 @@ def apply(state: AgentState) -> dict[str, Any]:
         "route_history": [{"agent": "supervisor", "decision": route, "iteration": state.get("iteration", 0), "note": note}],
     }
     if route == "abort":
+        if is_attention_open(state.get("attention")):
+            delta["abort_reason"] = "等待人工决定（attention 未回答）"
+            delta["ticket_stage"] = "awaiting_answer"
+            delta["report"] = state.get("report") or make_report(
+                state, "blocked", "等待人工决定"
+            )
+            delta["attention"] = state["attention"]
+            delta["success"] = False
+            return delta
+
         blocking, reasons = has_blocking_issues(state.get("alignment", {}), state.get("security", {}))
-        if state.get("code_attempts", 0) >= SETTINGS.max_code_attempts and not latest_artifacts(state):
+        scope_violations = state.get("pending_scope_violations") or []
+        if mandate_error:
+            delta["abort_reason"] = f"计划授权校验失败：{mandate_error}"
+        elif scope_violations and not latest_artifacts(state):
+            delta["abort_reason"] = (
+                "产物越出已批准计划范围且已被拒绝写入："
+                + ", ".join(scope_violations)
+            )
+        elif state.get("code_attempts", 0) >= SETTINGS.max_code_attempts and not latest_artifacts(state):
             delta["abort_reason"] = (
                 f"coder 连续 {state.get('code_attempts')} 次未产出任何文件"
                 f"（上限 {SETTINGS.max_code_attempts}），交还人类检查提示词或模型输出格式"
@@ -126,6 +175,20 @@ def apply(state: AgentState) -> dict[str, Any]:
                 + (f"；仍存在未解决问题: {'; '.join(reasons[:3])}" if reasons else "")
             )
         delta["success"] = False
+        delta["ticket_stage"] = "failed"
+        delta["report"] = make_report(state, "failed", delta["abort_reason"])
+        # 如果上游节点已经生成了更具体的待办（例如“是否把越界文件纳入范围”），
+        # 保留它；否则再生成通用的“重试/终止”待办。
+        existing_attention = state.get("attention") or {}
+        if existing_attention and not existing_attention.get("answered_at"):
+            delta["attention"] = existing_attention
+        else:
+            delta["attention"] = make_attention(
+                f"任务中止：{delta['abort_reason']}。是否重试或终止？",
+                options=[{"id": "retry", "label": "重试"}, {"id": "abort", "label": "终止任务"}],
+                source="supervisor",
+                detail={"reasons": reasons[:5], "files": scope_violations},
+            )
     return delta
 
 

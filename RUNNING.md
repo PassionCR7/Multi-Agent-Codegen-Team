@@ -1,6 +1,22 @@
-**五、三种运行入口**
+**五、四种运行入口**
 
-### 1) Web 界面（推荐先试这个）
+### 1) Windows 桌面版（推荐）
+
+```powershell
+cd <项目根目录>
+.\.venv\Scripts\python.exe -m pip install -r requirements-desktop.txt
+.\.venv\Scripts\python.exe -m desktop.main
+```
+
+打包：
+
+```powershell
+.\packaging\build_windows.ps1
+```
+
+桌面版默认配置、日志和工作区在 `%APPDATA%\MultiAgentCodegenTeam\`。
+
+### 2) Web 界面（浏览器调试）
 
 ```bash
 cd <项目根目录>                                      # 换成你克隆后的实际路径
@@ -10,7 +26,7 @@ cd <项目根目录>                                      # 换成你克隆后�
 
 浏览器打开后：输入需求 → 看计划 → 批准/打回/自拟 → 看执行。
 
-### 2) 命令行交互式（会先让你确认计划）
+### 3) 命令行交互式（会先让你确认计划）
 
 ```bash
 ./.venv/Scripts/python.exe -m agents.main "你的需求" --project .
@@ -18,7 +34,7 @@ cd <项目根目录>                                      # 换成你克隆后�
 
 会自动询问：`1) 批准  2) 打回重规划  3) 我自己写方案`
 
-### 3) 全自动（CI / 脚本用）
+### 4) 全自动（CI / 脚本用）
 
 ```bash
 ./.venv/Scripts/python.exe -m agents.main "你的需求" --project . --auto-plan
@@ -58,6 +74,7 @@ CODER_MOCK=1 ./.venv/Scripts/python.exe -m agents.main "实现加法和减法" -
 # 跑自检
 ./.venv/Scripts/python.exe -m tests.selftest
 ./.venv/Scripts/python.exe -m tests.selftest_plan
+./.venv/Scripts/python.exe -m tests.test_desktop_backend
 ```
 
 ---

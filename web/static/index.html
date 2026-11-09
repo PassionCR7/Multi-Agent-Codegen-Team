@@ -152,6 +152,7 @@
   <h1>LangGraph 多智能体代码生成团队</h1>
   <span class="badge" id="cfgBadge">加载中…</span>
   <span class="badge">规划 → 确认 → 编码 / 对齐 / 安全 / 修复</span>
+  <button class="ghost" id="settingsBtn" type="button">设置</button>
 </header>
 
 <main>
@@ -165,11 +166,32 @@
     <label>项目根目录（agent 会扫描它以避免偏离真实项目）</label>
     <div class="row">
       <input type="text" id="projectRoot" class="grow" />
+      <button class="ghost" id="chooseProjectBtn" type="button">选择文件夹</button>
       <button id="startBtn">生成行动计划</button>
     </div>
     <div class="muted" style="margin-top:8px">
       生成计划后由你确认；不满意可打回重规划，也可以自己写方案。
     </div>
+  </div>
+
+  <!-- 模型设置 -->
+  <div class="card hidden" id="settingsCard">
+    <h2>模型设置</h2>
+    <label>API Key（留空表示保留已有 Key）</label>
+    <input type="password" id="setApiKey" placeholder="sk-..." autocomplete="off" />
+    <div style="height:10px"></div>
+    <label>Base URL</label>
+    <input type="text" id="setBaseUrl" placeholder="https://api.deepseek.com/v1" />
+    <div style="height:10px"></div>
+    <label>模型名</label>
+    <input type="text" id="setModel" placeholder="deepseek-chat" />
+    <div style="height:12px"></div>
+    <label><input type="checkbox" id="setMock" style="width:auto;margin-right:8px" /> 离线 Mock 模式（不需要 API Key）</label>
+    <div class="row" style="margin-top:14px">
+      <button id="settingsSave">保存设置</button>
+      <button class="ghost" id="settingsCancel">取消</button>
+    </div>
+    <div class="muted" style="margin-top:10px">设置保存在用户数据目录；API Key 不会显示回页面。</div>
   </div>
 
   <!-- 状态条 -->
@@ -178,9 +200,20 @@
       <div class="row">
         <span class="status" id="statusPill"><span class="dot"></span><span id="statusText">…</span></span>
         <span class="muted" id="wsPath"></span>
+        <button class="ghost" id="openWorkspaceBtn" type="button" style="display:none">打开工作区</button>
       </div>
       <span class="muted" id="taskId"></span>
     </div>
+  </div>
+
+  <!-- 待你决定（Attention） -->
+  <div class="card hidden" id="attentionCard" style="border-color:rgba(210,153,34,.55)">
+    <h2><span class="num">!</span>待你决定</h2>
+    <div id="attentionQuestion" style="font-weight:600;margin-bottom:10px"></div>
+    <div class="muted" id="attentionDetail" style="margin-bottom:10px"></div>
+    <label>需要纳入范围的文件（逗号分隔，仅“纳入范围”时需要）</label>
+    <input type="text" id="attentionScope" placeholder="例如：src/extra.py, tests/test_extra.py" />
+    <div class="row" style="margin-top:12px" id="attentionActions"></div>
   </div>
 
   <!-- 步骤 2：计划审核 -->
@@ -251,7 +284,8 @@
 
 <script>
 const $ = (id) => document.getElementById(id);
-let taskId = null, timer = null, lastStatus = null, renderedPlanRev = null, renderedArtifacts = 0;
+let taskId = null, timer = null, lastStatus = null, lastSnapshot = null, renderedPlanRev = null, renderedArtifacts = 0;
+let lastAttentionId = null;
 
 // ---------- 初始化：从后端拿到默认项目根目录与模型信息 ----------
 let DEFAULT_PROJECT = '';
@@ -279,7 +313,86 @@ let DEFAULT_PROJECT = '';
   }
 })();
 
+// ---------- 桌面模式 ----------
+function isDesktop() {
+  return !!(window.pywebview && window.pywebview.api);
+}
+
+window.addEventListener('pywebviewready', () => {
+  document.body.dataset.desktop = '1';
+  const badge = $('cfgBadge');
+  if (badge && !badge.textContent.includes('桌面版')) {
+    badge.textContent = badge.textContent + ' · 桌面版';
+  }
+});
+
+// ---------- 模型设置 ----------
+async function openSettings() {
+  try {
+    const res = await fetch('/api/settings');
+    const st = await res.json();
+    $('setBaseUrl').value = st.base_url || '';
+    $('setModel').value = st.model || '';
+    $('setMock').checked = !!st.mock;
+    $('setApiKey').value = '';
+    $('setApiKey').placeholder = st.has_api_key ? '已保存，留空表示不修改' : 'sk-...';
+    show('settingsCard');
+  } catch (e) {
+    alert('读取设置失败: ' + e.message);
+  }
+}
+
+$('settingsBtn').onclick = openSettings;
+$('settingsCancel').onclick = () => $('settingsCard').classList.add('hidden');
+$('settingsSave').onclick = async () => {
+  const payload = {
+    base_url: $('setBaseUrl').value.trim(),
+    model: $('setModel').value.trim(),
+    mock: $('setMock').checked,
+  };
+  const key = $('setApiKey').value.trim();
+  if (key) payload.api_key = key;
+  try {
+    const res = await fetch('/api/settings', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || '保存失败');
+    $('settingsCard').classList.add('hidden');
+    $('cfgBadge').textContent = `模型: ${data.mock ? '离线 MockLLM' : (data.model + ' @ ' + (data.base_url || '默认端点'))}`;
+    alert('设置已保存。下一次任务会使用新配置。');
+  } catch (e) {
+    alert('保存设置失败: ' + e.message);
+  }
+};
+
 // ---------- 创建任务 ----------
+$('chooseProjectBtn').onclick = async () => {
+  if (!isDesktop() || !window.pywebview.api.choose_folder) {
+    alert('文件夹选择只在桌面版可用；浏览器模式请手动输入路径。');
+    return;
+  }
+  try {
+    const folder = await window.pywebview.api.choose_folder();
+    if (folder) $('projectRoot').value = folder;
+  } catch (e) {
+    alert('选择文件夹失败: ' + e.message);
+  }
+};
+
+$('openWorkspaceBtn').onclick = async () => {
+  const path = lastSnapshot && lastSnapshot.workspace;
+  if (!path) return;
+  if (isDesktop() && window.pywebview.api.open_path) {
+    const ok = await window.pywebview.api.open_path(path);
+    if (!ok) alert('打开工作区失败：' + path);
+  } else {
+    alert('工作区路径：' + path);
+  }
+};
+
 $('startBtn').onclick = async () => {
   const requirement = $('requirement').value.trim();
   if (!requirement) { alert('请先填写需求描述'); return; }
@@ -337,16 +450,38 @@ const STATUS_LABEL = {
   error: '出错',
 };
 
+const STAGE_LABEL = {
+  plan_review: '等待你审核计划',
+  queued: '排队中',
+  working: '执行中',
+  awaiting_answer: '等待你回答',
+  awaiting_review: '等待你验收',
+  blocked: '已卡住',
+  failed: '执行失败',
+  done: '已完成',
+  aborted: '已终止',
+};
+
 function render(s) {
-  // 状态胶囊
+  lastSnapshot = s;
+  // 状态胶囊：优先显示面向人的 stage
   const pill = $('statusPill');
+  const stage = s.stage || s.ticket_stage;
   pill.className = 'status s-' + s.status;
-  $('statusText').textContent = STATUS_LABEL[s.status] || s.status;
-  if (s.workspace) $('wsPath').textContent = s.workspace;
+  $('statusText').textContent = STAGE_LABEL[stage] || STATUS_LABEL[s.status] || s.status;
+  if (s.workspace) {
+    $('wsPath').textContent = s.workspace;
+    $('openWorkspaceBtn').style.display = 'inline-block';
+  } else {
+    $('openWorkspaceBtn').style.display = 'none';
+  }
   if (s.snapshot_totals && s.snapshot_totals.files_scanned && lastStatus !== s.status) {
     /* 首次扫描信息可在日志里看 */
   }
   lastStatus = s.status;
+
+  // 待你决定
+  renderAttention(s);
 
   // 计划
   if (s.plan && Object.keys(s.plan).length) {
@@ -505,6 +640,60 @@ function esc(t) {
   return String(t == null ? '' : t)
     .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
     .replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+}
+
+// ---------- 待办（Attention） ----------
+function renderAttention(s) {
+  const a = s.attention;
+  if (!a || a.answered_at || !a.question) {
+    $('attentionCard').classList.add('hidden');
+    return;
+  }
+  show('attentionCard');
+  $('attentionQuestion').textContent = a.question;
+  if (a.id && a.id !== lastAttentionId) {
+    lastAttentionId = a.id;
+    if (isDesktop() && window.pywebview.api.notify) {
+      Promise.resolve(window.pywebview.api.notify('需要你决定', a.question)).catch(() => {});
+    }
+  }
+  const files = (a.detail && a.detail.files) ? a.detail.files : [];
+  $('attentionDetail').textContent = files.length ? ('涉及文件：' + files.join(', ')) : '';
+  const opts = a.options && a.options.length ? a.options : [
+    {id: 'retry', label: '重试'},
+    {id: 'abort', label: '终止任务'},
+  ];
+  $('attentionActions').innerHTML = opts.map(o => {
+    const cls = o.id === 'abort' ? 'danger' : 'approve';
+    return `<button class="${cls}" data-opt="${esc(o.id)}">${esc(o.label)}</button>`;
+  }).join('');
+  $('attentionActions').querySelectorAll('button').forEach(btn => {
+    btn.onclick = () => submitAttention(btn.dataset.opt, btn);
+  });
+}
+
+async function submitAttention(option, btn) {
+  btn.disabled = true;
+  const attention = (lastSnapshot && lastSnapshot.attention) || {};
+  const scope = ($('attentionScope').value || '').trim();
+  try {
+    const res = await fetch(`/api/tasks/${taskId}/attention`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        attention_id: attention.id || '',
+        option,
+        scope_files: scope,
+      }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || '提交失败');
+    $('attentionScope').value = '';
+    poll();
+  } catch (e) {
+    alert('提交失败: ' + e.message);
+    btn.disabled = false;
+  }
 }
 
 // ---------- 审核动作 ----------

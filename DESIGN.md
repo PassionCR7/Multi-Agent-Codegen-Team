@@ -72,7 +72,7 @@ tests/  约 1300 行，166 项断言
 
 ## 3. 数据层
 
-### 3.1 共享状态（`AgentState`，26 字段）
+### 3.1 共享状态（`AgentState`，32 字段）
 
 状态是 agent 间的"信封"。设计上刻意把**持久化事实**与**流转决策**分开：
 
@@ -87,8 +87,11 @@ iteration, bugfix_rounds, plan_rounds, code_attempts, phase, next_agent
 artifacts[], route_history[], feedback[], errors[]
 
 # 各 agent 最新结论（覆盖式）
-plan, alignment, security, bugfix, reconcile, coder_notes,
+plan, mandate, alignment, security, bugfix, reconcile, coder_notes,
 pending_scope_violations[], read_audit[]
+
+# Ticket 生命周期（P1）
+ticket_id, ticket_stage, attention, report, assignments[]
 
 # 输出
 final_summary, success, abort_reason
@@ -110,7 +113,7 @@ final_summary, success, abort_reason
 
 ```
 task.md                 人类可读任务书 + 验收标准
-status.json             机器可读实时状态（阶段/轮次/含 requirement）
+status.json             机器可读实时状态（阶段/轮次/含 requirement + ticket_stage/report/attention/mandate）
 messages.jsonl          黑板消息流（append-only）
 runs.jsonl              运行日志（每步耗时与结果）
 project_snapshot.json   真实项目快照（防跑偏输入）
@@ -141,17 +144,64 @@ Plan 是**数据结构**而非一段文本。理由：只有把文件清单变�
 }
 ```
 
-`scope.files` 是**可被程序判定的白名单**，由 `check_scope()` 执法：
+`scope.files` 是**可被程序判定的白名单**，由 `mandate.ScopeGuard` 在**写盘前**执法：
 
 ```
-产物路径归一化（去 ./、反斜杠、大小写）
+路径归一化（拒绝绝对路径 / .. / 空路径）
       ↓
-在白名单内？ → 通过
+在白名单内？ → 允许写入
 计划写了目录（dir/）？ → 其下新增文件视为在范围内
-否则 → 记入 violations → 注入对齐报告(major) → aligned=False → 最终判定失败
+否则 → 拒绝写入 artifacts/ → 留档到 reports/scope_rejected/
+      → 生成 attention（待你决定）→ 任务暂停
 ```
+
+这比"先写出来再检查"更硬：提示词可以请求，代码闸门才负责拒绝。
 
 `assumptions` 与 `open_questions` 是 Plan 的**核心价值**：如果 Plan 只是复述需求，审核就是走过场。真正值得人看的是模型**没把握的地方**。实测中规划官对"手机号校验"主动提出了 5 个待确认问题（+86 前缀、号段严格度、放置位置、命名、返回值形式）。
+
+### 3.4 Mandate（`mandate.py`）—— 计划授权的不可变载体
+
+用户批准计划时，系统生成一份 `Mandate`：
+
+```python
+{
+  "id": "...",
+  "plan_revision": 2,
+  "plan_digest": "sha256...",
+  "scope_files": ["src/", "tests/test_x.py"],
+  "out_of_scope": ["不引入第三方依赖"],
+  "approved_at": "...",
+  "approved_by": "user",
+  "policy_version": "local-v1"
+}
+```
+
+执行前 `supervisor.decide()` 会校验：
+
+1. 计划仍处于 `approved` / `user_written`；
+2. `plan.revision` 与授权一致；
+3. 计划内容指纹（排序后的稳定 JSON）与授权一致。
+
+任何一项不满足 → `abort`，原因写入 `status.json` 和 `reports/final_state.json`。
+创建授权后，`scope.files` 不能再被节点或后续请求悄悄改动；要扩大范围，必须生成新的计划版本并重新批准。
+
+### 3.5 Ticket 生命周期（`lifecycle.py`）—— 状态牌与待办
+
+`ticket_stage` 是面向人的阶段，和 `phase`（路由变量）分开：
+
+| 阶段 | 含义 |
+|---|---|
+| `plan_review` | 计划待人工审核 |
+| `queued` | 已批准，等待执行 |
+| `working` | 执行中 |
+| `awaiting_answer` | 有 `attention`，等用户回答 |
+| `awaiting_review` | 产出 ready，等用户验收 |
+| `blocked` / `failed` | 卡住 / 失败 |
+| `done` / `aborted` | 结束 |
+
+`report` 使用固定状态：`progress / waiting / ready / blocked / failed / dropped`。
+`attention` 一次只包含一个问题，并带 2～3 个可执行选项（例如 `expand_scope` / `abort`）。
+`runner.py` 在每个节点后把这三个字段写进 `status.json`；Web 顶部优先显示"待你决定"。
 
 ---
 
@@ -187,6 +237,8 @@ Plan 是**数据结构**而非一段文本。理由：只有把文件清单变�
 |---|---|---|---|
 | 0 | `iteration >= 6` | abort | 总轮次熔断 |
 | 0.5 | 无已批准计划 | planner / abort | **计划闸门**；`plan_rounds>=5` 则 abort |
+| 0.6 | 已批准计划但 Mandate 缺失/指纹不匹配 | abort | **授权闸门**：计划被改过就不许执行 |
+| 0.7 | 有未回答的 `attention` | abort（保持等待） | **人工闸门**：先回答问题，再继续 |
 | 1 | 无代码产物 | coder / abort | **交白卷闸门**；`code_attempts>=3` 则 abort |
 | 2 | `phase == "bugfixing"` | repair | **复检闸门**（见下） |
 | 3 | 无对齐报告 | aligner | |
@@ -205,6 +257,8 @@ for mode, chunk in app.stream(state, stream_mode=["updates", "values"]):
 ```
 
 **为什么必须两个都订阅？** 带 `operator.add` reducer 的列表字段，在 `updates` 里是节点的**原始返回值**。若某节点返回空列表（如 bugfixer 无补丁时返回 `artifacts: []`），直接用 `updates` 覆盖会把之前累积的产物**整体清空**。开发中真实踩到：修复阶段一来，产物数就归零，最终产物丢失。
+
+每个 `values` 快照之后，`runner` 还会调用 `lifecycle.derive_stage()`，把 `ticket_stage / report / attention` 写入 `status.json`，供 Web 轮询。
 
 ---
 
@@ -331,6 +385,38 @@ coder 若不确定既有模块的真实接口，可在 JSON 里返回 `need_file
 
 **熔断**：`max_plan_rounds` 用尽仍未达成一致 → 工作区标记 `aborted`，如实交还人类。
 
+### 6.1 桌面外壳（`desktop/`）
+
+桌面版不重写 agent，只给现有 Web 服务套一个 pywebview 原生窗口：
+
+```
+desktop/main.py
+  → 单实例锁
+  → 读取 AppData 配置（最近项目 / 窗口几何）
+  → DesktopBackend.start()
+      → web.server.create_server(port=0, token=随机值, workspace_root=AppData/workspaces)
+      → /api/health 就绪探测
+  → pywebview.create_window(page_url + "?desktop=1")
+  → 用户操作（文件夹选择 / 审核 / 待办 / 打开工作区）
+  → 关闭窗口：有任务则确认；确认后 server.shutdown()
+```
+
+**关键设计**：
+
+| 点 | 做法 |
+|---|---|
+| 独立窗口 | pywebview（Windows 使用 Edge WebView2 / WinForms Chromium） |
+| 不重写 UI | 继续加载 `web/static/index.html`，同源访问本地 API |
+| 动态端口 | `port=0`，避免 8765 被占用 |
+| 本地安全 | 只绑 `127.0.0.1` + 随机 token + 同源 Cookie |
+| 数据目录 | `%APPDATA%\MultiAgentCodegenTeam\`，避免写安装目录 |
+| 工作区 | 默认 AppData/workspaces，不污染用户项目 |
+| 模型设置 | 窗口内设置面板；API Key / Base URL / 模型 / Mock 存 AppData |
+| 关闭保护 | 有任务时弹确认，避免默默杀掉执行中的任务 |
+| 浏览器调试 | `python web/server.py` 仍保留，token 为空时不启用鉴权 |
+
+**打包**：PyInstaller one-dir + Inno Setup（可选），入口为 `desktop/main.py`，静态资源 `web/static` 作为 data 打入。
+
 ---
 
 ## 7. 配置全表（22 项）
@@ -359,14 +445,16 @@ coder 若不确定既有模块的真实接口，可在 JSON 里返回 `need_file
 
 ## 8. 测试与验证
 
-166 项断言，三个专项自检 + 一个端到端测试：
+249 项断言，五个专项自检 + 一个端到端测试：
 
 | 文件 | 项数 | 覆盖 |
 |---|---|---|
 | `tests/selftest.py` | 58 | 执行阶段：修复闭环、四类熔断、范围约束、reducer 回归、按需阅读、安全读取 |
 | `tests/selftest_plan.py` | 33 | 计划阶段：三条审核路径、用户自拟、计划熔断 |
 | `tests/selftest_multimodule.py` | 52 | 模块拆分、对账闭环、**共享状态文档与漂移回归**、修补安全性 |
-| `tests/test_web_api.py` | 23 | Web API 端到端（含并发安全、路径穿越防护） |
+| `tests/selftest_mandate.py` | 41 | Mandate 指纹、路径归一化、写前范围闸门、生命周期、篡改中止 |
+| `tests/test_desktop_backend.py` | 27 | 动态端口、健康检查、token/Cookie、模型设置、DesktopBackend、单实例 |
+| `tests/test_web_api.py` | 38 | Web API 端到端（含阶段牌、待办、范围重跑、并发安全、路径穿越防护） |
 
 **测试方法论**：用可编程桩 LLM（`ScriptedLLM` / 自定义 stub）精确控制模型返回，从而验证**流程逻辑**而非模型智力。离线可跑，`CODER_MOCK=1` 即全绿。
 
@@ -381,7 +469,7 @@ coder 若不确定既有模块的真实接口，可在 JSON 里返回 `need_file
 
 | 局限 | 说明 |
 |---|---|
-| 强约束不覆盖"内容正确性" | `check_scope` 只管**文件路径**合规，管不了文件内容是否合理 |
+| 强约束不覆盖"内容正确性" | `Mandate` 只管**文件路径**合规，管不了文件内容是否合理 |
 | `apply_patch` 依赖唯一匹配 | 目标片段出现多次即拒绝；复杂重构需退回重写文件 |
 | 重复定义检测会漏"同签名"情况 | 刻意控噪的代价；同签名重复定义不报 |
 | 机器信号不做全量调用分析 | 跨语言、动态特性场景可能漏判 |
@@ -399,5 +487,7 @@ coder 若不确定既有模块的真实接口，可在 JSON 里返回 `need_file
 
 - **加一个 agent**：`nodes.py` 写节点 → `graph.py` 注册 → `supervisor.py` 加路由分支 → `state.py` 声明输出字段（**务必声明，否则静默丢弃**）。
 - **换审核方式**：实现 `reviewer` 协议即可（如对接外部审批系统 API），无需改流程。
+- **扩展生命周期**：在 `lifecycle.py` 增加阶段/报告状态 → `runner.py` 发布 → `web/server.py` 暴露 → 前端 `renderAttention()` 展示。
+- **扩展授权**：若要增加审批人/策略版本，扩展 `Mandate` 字段即可；不要直接改 `scope.files`。
 - **换持久化**：`build_graph(checkpointer=SqliteSaver(...))` 支持断点续跑与时间旅行。
 - **接入 CI**：`run_team()` 返回 `success` / `workspace_dir`，可直接作门禁；计划环节用 `--auto-plan` 跳过。
